@@ -3,6 +3,13 @@
 import math
 import numpy as np
 
+#constants
+KP = 2.0
+KI = 0.01
+KD = 2.0
+DESIRED_BALL_HEADING = 0.0
+TIME_STEP = 32
+MAX_SPEED = 6.5
 
 class StudentController:
     def __init__(self):
@@ -18,9 +25,9 @@ class StudentController:
             "corners": [(-4.5, 3), (-4.5, -3), (4.5, 3), (4.5, -3)]
         }
 
-        self.KP = 0.0
-        self.KI = 0.0
-        self.KD = 0.0
+        # pid integral error
+        self.integral_error = 0.0
+        self.previous_error = 0.0
 
     def ekf_prediction(self, ds, dtheta):
         x_prev = self.mu[0]
@@ -145,9 +152,38 @@ class StudentController:
 
         estimated_pose = self.mu.tolist()
         print(estimated_pose)
+        
+        meas_ball_heading = sensors["ball"][1]
+        error = DESIRED_BALL_HEADING - meas_ball_heading
 
-         # TODO: add your controllers here.
-        control_dict["left_motor"] = -6.5
-        control_dict["right_motor"] = 6.5
+        # p stuff
+        p_term = KP * error
+
+        # i stuff
+        dt = TIME_STEP / 1000.0
+        self.integral_error += error * dt
+        self.integral_error = max(-0.5, min(0.5, self.integral_error))      # bound error over time
+        i_term = KI * self.integral_error
+
+        # d stuff
+        derivative = (error - self.previous_error) / dt
+        d_term = KD * derivative
+        self.previous_error = error
+
+        turn = p_term + i_term + d_term
+        turn = max(-0.5 * MAX_SPEED, min(0.5 * MAX_SPEED, turn)) # another stupid check
+
+        left_motor = MAX_SPEED + turn
+        right_motor = MAX_SPEED - turn
+
+        # speed clipping
+        control_dict["left_motor"] = max(-MAX_SPEED, min(MAX_SPEED, left_motor))
+        control_dict["right_motor"] = max(-MAX_SPEED, min(MAX_SPEED, right_motor))
+
+        # if (1.5 < self.mu[2] < 1.6):
+        #     control_dict["left_motor"] = 6.5
+        #     control_dict["right_motor"] = 6.5
+
+        print(sensors["goal"])
 
         return control_dict
