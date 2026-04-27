@@ -6,10 +6,14 @@ import numpy as np
 #constants
 KP = 2.0
 KI = 0.01
-KD = 2.0
-DESIRED_BALL_HEADING = 0.0
+KD = 0.0
+
+K_PATH = 2.0
+KD_PATH = 0.5
+
 TIME_STEP = 32
 MAX_SPEED = 6.5
+SET_SPEED = 6.5
 
 class StudentController:
     def __init__(self):
@@ -29,26 +33,34 @@ class StudentController:
         self.integral_error = 0.0
         self.previous_error = 0.0
 
+        # path
+        self.desired_path_angle = 0.0
+        self.desired_path_point = (0.0, 0.0)
+        self.prev_e_path = 0.0
+
+    def wrap(self, angle):
+        return np.arctan2(np.sin(angle), np.cos(angle))
+
     def ekf_prediction(self, ds, dtheta):
         x_prev = self.mu[0]
         y_prev = self.mu[1]
         theta_prev = self.mu[2]
 
-        theta = theta_prev + dtheta
+        theta_new = self.wrap(theta_prev - dtheta)
 
         # print("theta_prev:", theta_prev)
         # print("pred dx step:", ds*np.cos(theta_prev), ds*np.sin(theta_prev))
 
         # jacobian of a differential drive motion model (called A in the math i read)
         A = np.array([[1, 0, -ds*np.sin(theta_prev)],
-                        [0, 1, ds*np.cos(theta_prev)], 
-                        [0, 0, 1]
+                      [0, 1, ds*np.cos(theta_prev)], 
+                      [0, 0, 1]
         ])
 
         # mean state as predicted by motion model
         mu_bar = np.array([x_prev + ds*np.cos(theta_prev), 
-                        y_prev + ds*np.sin(theta_prev),
-                        np.arctan2(np.sin(theta), np.cos(theta))
+                           y_prev + ds*np.sin(theta_prev),
+                           theta_new
         ])
 
         # simple noise, tune with velocity and coefficients later
@@ -75,13 +87,13 @@ class StudentController:
 
         r_pred = np.sqrt(q)
         phi_pred = np.arctan2(dy, dx) - self.mu[2]
-        phi_pred = np.arctan2(np.sin(phi_pred), np.cos(phi_pred))
+        phi_pred = self.wrap(phi_pred)
 
         z_hat = np.array([r_pred, phi_pred])
 
         # observation model jacobian
         H = np.array([[-dx/r_pred, -dy/r_pred, 0],
-                    [dy/q, -dx/q, -1]
+                      [dy/q, -dx/q, -1]
         ])
 
         R = np.diag([0.1**2, 0.05**2])
@@ -97,7 +109,7 @@ class StudentController:
         y[1] = np.arctan2(np.sin(y[1]), np.cos(y[1]))
 
         self.mu = self.mu + K @ y
-        self.mu[2] = np.arctan2(np.sin(self.mu[2]), np.cos(self.mu[2]))
+        self.mu[2] = self.wrap(self.mu[2])
         self.Sigma = (np.identity(3) - (K @ H)) @ self.Sigma
 
         # return H, S, K, y
@@ -124,14 +136,68 @@ class StudentController:
     # landmark matching using heuristic (euclidean)
     def feature_match(self, sensors):
         for landmark_id in sensors:
-            if landmark_id == "center_cirlce":
-                r_meas, phi_meas = sensors[landmark_id]
-                (x_j, y_j) = self.heuristic(landmark_id, r_meas, phi_meas)
-                self.ekf_update(x_j, y_j, r_meas, phi_meas)
-            elif landmark_id in ["goal", "penalty_cross", "corners"]:
-                for (r_meas, phi_meas) in sensors[landmark_id]:
-                    (x_j, y_j) = self.heuristic(landmark_id, r_meas, phi_meas)
+            if landmark_id == "center_circle":
+                # if somethings not seen but label is still in sensors ignore it
+                try:
+                    r_meas, phi_meas = sensors[landmark_id]
+                    x_j, y_j = self.heuristic(landmark_id, r_meas, phi_meas)
                     self.ekf_update(x_j, y_j, r_meas, phi_meas)
+                except:
+                    pass
+            elif landmark_id in ["goal", "penalty_cross", "corners"]:
+                try:
+                    for (r_meas, phi_meas) in sensors[landmark_id]:
+                        x_j, y_j = self.heuristic(landmark_id, r_meas, phi_meas)
+                        self.ekf_update(x_j, y_j, r_meas, phi_meas)
+                except:
+                    pass
+
+    def controller(self, sensors):
+        dt = TIME_STEP / 1000.0
+
+        r_ball, phi_ball = sensors["ball"]
+
+        ball_bearing_world = self.mu[2] + phi_ball
+        ball_x = self.mu[0] + r_ball * np.cos(ball_bearing_world)
+        ball_y = self.mu[1] + r_ball * np.sin(ball_bearing_world)
+
+        dx = ball_x - self.desired_path_point[0]
+        dy = ball_y - self.desired_path_point[1]
+
+        e_path = -np.sin(self.desired_path_angle) * dx + np.cos(self.desired_path_angle) * dy 
+        de_path = (e_path - self.prev_e_path) / dt
+        self.prev_e_path = e_path
+
+        desired_push_angle = self.desired_path_angle + K_PATH * e_path + KD_PATH * de_path
+        desired_phi = self.wrap(desired_push_angle - self.mu[2])
+        desired_phi = max(-0.35, min(0.35, desired_phi))
+
+        error = self.wrap(phi_ball - desired_phi)
+
+        # p stuff
+        p_term = KP * error
+
+        # i stuff
+        self.integral_error += error * dt
+        self.integral_error = max(-0.5, min(0.5, self.integral_error))      # bound error over time
+        i_term = KI * self.integral_error
+
+        # d stuff
+        derivative = (error - self.previous_error) / dt
+        d_term = KD * derivative
+        self.previous_error = error
+
+        turn = p_term + i_term + d_term
+        turn = max(-0.25 * MAX_SPEED, min(0.25 * MAX_SPEED, turn)) # another stupid check
+
+        left_motor = SET_SPEED - turn
+        right_motor = SET_SPEED + turn
+
+        # clip speed
+        left_motor = max(-MAX_SPEED, min(MAX_SPEED, left_motor))
+        right_motor = max(-MAX_SPEED, min(MAX_SPEED, right_motor))
+
+        return {"left_motor": left_motor, "right_motor": right_motor}
         
     def step(self, sensors):
         """
@@ -153,32 +219,7 @@ class StudentController:
         estimated_pose = self.mu.tolist()
         print(estimated_pose)
         
-        meas_ball_heading = sensors["ball"][1]
-        error = DESIRED_BALL_HEADING - meas_ball_heading
-
-        # p stuff
-        p_term = KP * error
-
-        # i stuff
-        dt = TIME_STEP / 1000.0
-        self.integral_error += error * dt
-        self.integral_error = max(-0.5, min(0.5, self.integral_error))      # bound error over time
-        i_term = KI * self.integral_error
-
-        # d stuff
-        derivative = (error - self.previous_error) / dt
-        d_term = KD * derivative
-        self.previous_error = error
-
-        turn = p_term + i_term + d_term
-        turn = max(-0.5 * MAX_SPEED, min(0.5 * MAX_SPEED, turn)) # another stupid check
-
-        left_motor = MAX_SPEED + turn
-        right_motor = MAX_SPEED - turn
-
-        # speed clipping
-        control_dict["left_motor"] = max(-MAX_SPEED, min(MAX_SPEED, left_motor))
-        control_dict["right_motor"] = max(-MAX_SPEED, min(MAX_SPEED, right_motor))
+        control_dict = self.controller(sensors)
 
         # if (1.5 < self.mu[2] < 1.6):
         #     control_dict["left_motor"] = 6.5
