@@ -7,6 +7,8 @@ KP = 2.0
 KI = 0.0
 KD = 0.0
 
+KP_BALL = 2.0
+
 K_PATH = 0.05
 MAX_CORR = 0.08
 
@@ -15,17 +17,35 @@ MAX_SPEED = 6.5
 
 ALPHA = 0.8
 
-# cost function weights
-W_PATH = 0.0
-W_GOAL = 0.0
-W_DISTANCE = 0.0
+W_PATH = 500.0
+W_GOAL = 0.1
+W_CONTACT = 0.5
+W_BEARING = 30.0
+K_BALL_PATH = 2.0
 
-# mpc time horizon
-TIME_HORIZON = 15
-CONTACT_DISTANCE = 0.25
+TIME_HORIZON = 20
+APPROACH_DISTANCE = 0.6
+CONTACT_DISTANCE = 0.12
+CONTACT_OFFSET = 0.3   # distance behind ball (tune 0.25–0.4)
+
+STAGING_OFFSET = 0.25
+STAGING_TOL = 0.35
+ANGLE_TOL = 0.08
+BALL_CENTER_TOL = 0.12
+GOAL_REACHED_DIST = 0.25
+
+KP_STAGE_HEADING = 2.5
+KP_ALIGN = 2.0
+KP_PUSH = 2.0
+
+STAGE_SPEED = 3.0
+ALIGN_SPEED = 0.5
+PUSH_SPEED = 6.5
 
 class StudentController:
     def __init__(self):
+        self.finite_state = "FIND_BALL"
+        
         # ekf
         self.mu = np.array([0.0, 0.0, 0.0])
         self.Sigma = np.diag([0.1, 0.1, 1.0])
@@ -51,15 +71,20 @@ class StudentController:
         self.left_speed = SET_SPEED
 
         self.first_step = True
-        self.goal_coords = (0, 0)
+        self.goal_coords = (4.5, 0)       # NOTE: this must be changed later because the goal could be the other goal in 1v1
 
-        self.ds_candidates = [0.02, 0.04, 0.07 ]
-        self.dtheta_candidates = [-0.20, -0.10, 0.0, 0.10, 0.20]
+        self.ds_candidates = [0.05, 0.07, 0.10]
+        self.dtheta_candidates = [-0.25, -0.12, 0.0, 0.12, 0.25]
+
+        self.global_r_ball = 0
+        self.global_phi_ball = 0
 
     def wrap(self, angle):
         return np.arctan2(np.sin(angle), np.cos(angle))
 
-    def ekf_prediction(self, ds, dtheta):
+    def ekf_prediction(self, sensors):
+        ds, dtheta = sensors["odometry"]
+
         x_prev = self.mu[0]
         y_prev = self.mu[1]
         theta_prev = self.mu[2]
@@ -169,36 +194,6 @@ class StudentController:
                         self.ekf_update(x_j, y_j, r_meas, phi_meas)
                 except:
                     pass
-
-    def pid_controller(self, sensors):
-        r_ball, phi_ball = sensors["ball"]
-
-        ball_bearing_world = self.mu[2] + phi_ball
-        ball_y = self.mu[1] + r_ball * np.sin(ball_bearing_world)
-
-        e_path = ball_y
-
-        path_correction = K_PATH * e_path
-        path_correction = max(-MAX_CORR, min(MAX_CORR, path_correction))
-
-        desired_push_angle = self.desired_path_angle + path_correction
-        desired_phi = self.wrap(desired_push_angle - self.mu[2])
-
-        error = self.wrap(phi_ball - desired_phi)
-
-        turn = KP * error
-        turn = max(-0.20 * MAX_SPEED, min(0.20 * MAX_SPEED, turn))
-
-        left_motor = SET_SPEED - turn
-        right_motor = SET_SPEED + turn
-
-        left_motor = max(-MAX_SPEED, min(MAX_SPEED, left_motor))
-        right_motor = max(-MAX_SPEED, min(MAX_SPEED, right_motor))
-
-        return {
-            "left_motor": left_motor,
-            "right_motor": right_motor
-        }
     
     def mpc_predict(self, sensors, ds, dtheta):
         x_r, y_r, theta_r = self.mu
@@ -218,8 +213,8 @@ class StudentController:
             dist_to_ball_next = np.hypot(x_b - x_r_next, y_b - y_r_next)
 
             if min(dist_to_ball, dist_to_ball_next) < CONTACT_DISTANCE:
-                x_b_next = x_b + ds * ALPHA * np.cos(theta_r)
-                y_b_next = y_b + ds * ALPHA * np.sin(theta_r)
+                x_b_next = x_b + ds * ALPHA * np.cos(theta_r_next)
+                y_b_next = y_b + ds * ALPHA * np.sin(theta_r_next)
             else:
                 x_b_next = x_b
                 y_b_next = y_b
@@ -239,8 +234,27 @@ class StudentController:
         
     def mpc_cost_function(self, predicted_state):
         x_r, y_r, theta_r, x_b, y_b = predicted_state
-        
-        return (W_PATH * (y_b)**2) + (W_GOAL * (self.goal_coords[0] - x_b)**2) + (W_DISTANCE * (np.hypot(x_r - x_b, y_r - y_b))**2)
+
+        # path term (keep ball on y = 0), change to different trajectory later
+        path_cost = W_PATH * (y_b ** 2)
+
+        # goal term (push ball toward +x)
+        goal_cost = W_GOAL * (self.goal_coords[0] - x_b) ** 2
+
+        # contact geometry term (robot behind ball)
+        # desired push direction (for now: straight toward goal)
+        push_angle = 0.0
+
+        # where robot should be relative to ball
+        angle_to_ball = np.arctan2(y_b - y_r, x_b - x_r)
+        phi_pred = self.wrap(angle_to_ball - theta_r)
+
+        desired_phi = -K_BALL_PATH * y_b
+        desired_phi = max(-0.35, min(0.35, desired_phi))
+
+        bearing_cost = W_BEARING * (self.wrap(phi_pred - desired_phi) ** 2)
+
+        return path_cost + goal_cost + bearing_cost
     
     def mpc(self, sensors):
         all_running_costs = []
@@ -256,11 +270,149 @@ class StudentController:
             if candidate[2] < lowest_cost:
                 lowest_cost = candidate[2]
                 best_candidate = (candidate[0], candidate[1])
+            # print(candidate)
         
         return best_candidate
 
-    def traj_gen(self, sensors):
-        pass
+    def find_ball(self, sensors):
+        try:
+            r_ball, phi_ball = sensors["ball"]
+            self.finite_state = "GO_TO_STAGING_POINT"
+            return {"left_motor": 0.0, "right_motor": 0.0}
+        except:
+            left_motor = -6.5
+            right_motor = 6.5
+
+            return {
+                "left_motor": left_motor,
+                "right_motor": right_motor
+            }
+
+    
+    def get_ball_global(self, sensors):
+        x_r, y_r, theta_r = self.mu
+
+        try:
+            r_ball, phi_ball = sensors["ball"]
+
+            self.global_r_ball = r_ball
+            self.global_phi_ball = phi_ball
+        except:
+            pass
+
+        bearing = theta_r + self.global_phi_ball
+        x_b = x_r + self.global_r_ball * np.cos(bearing)
+        y_b = y_r + self.global_r_ball * np.sin(bearing)
+
+        return x_b, y_b
+
+
+    def get_line_of_action(self, sensors):
+        x_b, y_b = self.get_ball_global(sensors)
+
+        ball = np.array([x_b, y_b])
+        goal = np.array(self.goal_coords)
+
+        line_vec = goal - ball
+        norm = np.linalg.norm(line_vec)
+
+        if norm < 1e-6:
+            line_dir = np.array([1.0, 0.0])
+        else:
+            line_dir = line_vec / norm
+
+        staging = ball - STAGING_OFFSET * line_dir
+        line_angle = np.arctan2(line_dir[1], line_dir[0])
+
+        return x_b, y_b, staging, line_angle
+
+    def go_to_staging_point(self, sensors):
+        x_b, y_b, staging, line_angle = self.get_line_of_action(sensors)
+
+        x_r, y_r, theta_r = self.mu
+
+        dx = staging[0] - x_r
+        dy = staging[1] - y_r
+
+        dist = np.hypot(dx, dy)
+        target_angle = np.arctan2(dy, dx)
+        heading_error = self.wrap(target_angle - theta_r)
+
+        turn = KP_STAGE_HEADING * heading_error
+        turn = max(-0.35 * MAX_SPEED, min(0.35 * MAX_SPEED, turn))
+
+        forward = STAGE_SPEED
+
+        if dist < STAGING_TOL:
+            self.finite_state = "ALIGN_TO_LINE"
+
+        left = forward - turn
+        right = forward + turn
+
+        return {
+            "left_motor": max(-MAX_SPEED, min(MAX_SPEED, left)),
+            "right_motor": max(-MAX_SPEED, min(MAX_SPEED, right))
+        }
+
+
+    def align_to_line(self, sensors):
+        x_b, y_b, staging, line_angle = self.get_line_of_action(sensors)
+
+        theta_r = self.mu[2]
+
+        heading_error = self.wrap(line_angle - theta_r)
+
+        # Also keep ball centered while aligning
+        error = heading_error + 0.5 * self.global_phi_ball
+
+        turn = KP_ALIGN * error
+        turn = max(-0.25 * MAX_SPEED, min(0.25 * MAX_SPEED, turn))
+
+        forward = ALIGN_SPEED
+
+        if abs(heading_error) < ANGLE_TOL and abs(self.global_phi_ball) < BALL_CENTER_TOL:
+            self.finite_state = "PUSH_BALL"
+
+        left = forward - turn
+        right = forward + turn
+
+        return {
+            "left_motor": max(-MAX_SPEED, min(MAX_SPEED, left)),
+            "right_motor": max(-MAX_SPEED, min(MAX_SPEED, right))
+        }
+
+
+    def push_ball(self, sensors):
+        x_b, y_b, staging, line_angle = self.get_line_of_action(sensors)
+
+        theta_r = self.mu[2]
+
+        heading_error = self.wrap(line_angle - theta_r)
+
+        # Primary: keep ball centered. Secondary: stay on line angle.
+        error = self.global_phi_ball + 0.3 * heading_error
+
+        turn = KP_PUSH * error
+        turn = max(-0.15 * MAX_SPEED, min(0.15 * MAX_SPEED, turn))
+
+        forward = PUSH_SPEED
+
+        goal_dist = np.hypot(self.goal_coords[0] - x_b, self.goal_coords[1] - y_b)
+
+        if goal_dist < GOAL_REACHED_DIST:
+            self.finite_state = "DONE"
+
+        # If ball gets badly off-center, recover by going back to staging
+        if abs(self.global_phi_ball) > 0.45:
+            self.finite_state = "GO_TO_STAGING_POINT"
+
+        left = forward - turn
+        right = forward + turn
+
+        return {
+            "left_motor": max(-MAX_SPEED, min(MAX_SPEED, left)),
+            "right_motor": max(-MAX_SPEED, min(MAX_SPEED, right))
+        }
 
     def step(self, sensors):
         """
@@ -274,37 +426,34 @@ class StudentController:
         """
         control_dict = {"left_motor": 0.0, "right_motor": 0.0}
 
-        ds, dtheta = sensors["odometry"]
-
-        self.ekf_prediction(ds, dtheta)
+        self.ekf_prediction(sensors)
         self.feature_match(sensors)
 
         estimated_pose = self.mu.tolist()
         print(estimated_pose)
 
-        if self.first_step:
-            sensors["goal"][0][0]
-            self.goal_coords = self.map["goal"][0]       # whichever goal we're facing on startup should be the goal we want to score in (risky)
-            self.first_step = False
+        print(self.finite_state)
 
-        
-        best_ds, best_dtheta = self.mpc(sensors)
+        match self.finite_state:
+            case "FIND_BALL":
+                control_dict = self.find_ball(sensors)
 
-        gain_ds = MAX_SPEED / max(self.ds_candidates)
-        gain_dtheta = MAX_SPEED / max(self.dtheta_candidates)
+            case "GO_TO_STAGING_POINT":
+                control_dict = self.go_to_staging_point(sensors)
 
-        forward = gain_ds * best_ds
-        turn = gain_dtheta * best_dtheta
-    
-        control_dict["left_motor"] = forward - turn
-        control_dict["right_motor"] = forward + turn
+            case "ALIGN_TO_LINE":
+                control_dict = self.align_to_line(sensors)
+
+            case "PUSH_BALL":
+                control_dict = self.push_ball(sensors)
+
+            case "DONE":
+                control_dict = {"left_motor": 0.0, "right_motor": 0.0}
 
         # control_dict = self.pid_controller(sensors)
 
         # if (1.5 < self.mu[2] < 1.6):
         #     control_dict["left_motor"] = 6.5
         #     control_dict["right_motor"] = 6.5
-
-        print(sensors["goal"])
 
         return control_dict
