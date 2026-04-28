@@ -3,17 +3,26 @@
 import math
 import numpy as np
 
-#constants
 KP = 2.0
-KI = 0.01
+KI = 0.0
 KD = 0.0
 
-K_PATH = 2.0
-KD_PATH = 0.5
+K_PATH = 0.05
+MAX_CORR = 0.08
 
-TIME_STEP = 32
-MAX_SPEED = 6.5
 SET_SPEED = 6.5
+MAX_SPEED = 6.5
+
+ALPHA = 0.8
+
+# cost function weights
+W_PATH = 0.0
+W_GOAL = 0.0
+W_DISTANCE = 0.0
+
+# mpc time horizon
+TIME_HORIZON = 15
+CONTACT_DISTANCE = 0.25
 
 class StudentController:
     def __init__(self):
@@ -38,6 +47,15 @@ class StudentController:
         self.desired_path_point = (0.0, 0.0)
         self.prev_e_path = 0.0
 
+        self.right_speed = SET_SPEED
+        self.left_speed = SET_SPEED
+
+        self.first_step = True
+        self.goal_coords = (0, 0)
+
+        self.ds_candidates = [0.02, 0.04, 0.07 ]
+        self.dtheta_candidates = [-0.20, -0.10, 0.0, 0.10, 0.20]
+
     def wrap(self, angle):
         return np.arctan2(np.sin(angle), np.cos(angle))
 
@@ -46,7 +64,7 @@ class StudentController:
         y_prev = self.mu[1]
         theta_prev = self.mu[2]
 
-        theta_new = self.wrap(theta_prev - dtheta)
+        theta_new = self.wrap(theta_prev + dtheta)
 
         # print("theta_prev:", theta_prev)
         # print("pred dx step:", ds*np.cos(theta_prev), ds*np.sin(theta_prev))
@@ -152,53 +170,98 @@ class StudentController:
                 except:
                     pass
 
-    def controller(self, sensors):
-        dt = TIME_STEP / 1000.0
-
+    def pid_controller(self, sensors):
         r_ball, phi_ball = sensors["ball"]
 
         ball_bearing_world = self.mu[2] + phi_ball
-        ball_x = self.mu[0] + r_ball * np.cos(ball_bearing_world)
         ball_y = self.mu[1] + r_ball * np.sin(ball_bearing_world)
 
-        dx = ball_x - self.desired_path_point[0]
-        dy = ball_y - self.desired_path_point[1]
+        e_path = ball_y
 
-        e_path = -np.sin(self.desired_path_angle) * dx + np.cos(self.desired_path_angle) * dy 
-        de_path = (e_path - self.prev_e_path) / dt
-        self.prev_e_path = e_path
+        path_correction = K_PATH * e_path
+        path_correction = max(-MAX_CORR, min(MAX_CORR, path_correction))
 
-        desired_push_angle = self.desired_path_angle + K_PATH * e_path + KD_PATH * de_path
+        desired_push_angle = self.desired_path_angle + path_correction
         desired_phi = self.wrap(desired_push_angle - self.mu[2])
-        desired_phi = max(-0.35, min(0.35, desired_phi))
 
         error = self.wrap(phi_ball - desired_phi)
 
-        # p stuff
-        p_term = KP * error
-
-        # i stuff
-        self.integral_error += error * dt
-        self.integral_error = max(-0.5, min(0.5, self.integral_error))      # bound error over time
-        i_term = KI * self.integral_error
-
-        # d stuff
-        derivative = (error - self.previous_error) / dt
-        d_term = KD * derivative
-        self.previous_error = error
-
-        turn = p_term + i_term + d_term
-        turn = max(-0.25 * MAX_SPEED, min(0.25 * MAX_SPEED, turn)) # another stupid check
+        turn = KP * error
+        turn = max(-0.20 * MAX_SPEED, min(0.20 * MAX_SPEED, turn))
 
         left_motor = SET_SPEED - turn
         right_motor = SET_SPEED + turn
 
-        # clip speed
         left_motor = max(-MAX_SPEED, min(MAX_SPEED, left_motor))
         right_motor = max(-MAX_SPEED, min(MAX_SPEED, right_motor))
 
-        return {"left_motor": left_motor, "right_motor": right_motor}
+        return {
+            "left_motor": left_motor,
+            "right_motor": right_motor
+        }
+    
+    def mpc_predict(self, sensors, ds, dtheta):
+        x_r, y_r, theta_r = self.mu
+        r_ball, phi_ball = sensors["ball"]
+
+        x_b = x_r + r_ball * np.cos(theta_r + phi_ball)
+        y_b = y_r + r_ball * np.sin(theta_r + phi_ball)
+
+        running_cost = 0.0
+        counter = 0
+        while(counter < TIME_HORIZON):
+            x_r_next = x_r + ds * np.cos(theta_r)
+            y_r_next = y_r + ds * np.sin(theta_r)
+            theta_r_next = self.wrap(theta_r + dtheta)
+
+            dist_to_ball = np.hypot(x_b - x_r, y_b - y_r)
+            dist_to_ball_next = np.hypot(x_b - x_r_next, y_b - y_r_next)
+
+            if min(dist_to_ball, dist_to_ball_next) < CONTACT_DISTANCE:
+                x_b_next = x_b + ds * ALPHA * np.cos(theta_r)
+                y_b_next = y_b + ds * ALPHA * np.sin(theta_r)
+            else:
+                x_b_next = x_b
+                y_b_next = y_b
+
+            running_cost += self.mpc_cost_function([x_r_next, y_r_next, theta_r_next, x_b_next, y_b_next])
+
+            x_r = x_r_next
+            y_r = y_r_next
+            theta_r = theta_r_next
+            x_b = x_b_next
+            y_b = y_b_next
+
+            counter += 1
+
+        # return full state
+        return running_cost
         
+    def mpc_cost_function(self, predicted_state):
+        x_r, y_r, theta_r, x_b, y_b = predicted_state
+        
+        return (W_PATH * (y_b)**2) + (W_GOAL * (self.goal_coords[0] - x_b)**2) + (W_DISTANCE * (np.hypot(x_r - x_b, y_r - y_b))**2)
+    
+    def mpc(self, sensors):
+        all_running_costs = []
+
+        for ds_candidate in self.ds_candidates:
+            for dtheta_candidate in self.dtheta_candidates:
+                cost = self.mpc_predict(sensors, ds_candidate, dtheta_candidate)
+                all_running_costs.append((ds_candidate, dtheta_candidate, cost))
+    
+        lowest_cost = np.inf
+        best_candidate = (0, 0)
+        for candidate in all_running_costs:
+            if candidate[2] < lowest_cost:
+                lowest_cost = candidate[2]
+                best_candidate = (candidate[0], candidate[1])
+        
+        return best_candidate
+
+    def traj_gen(self, sensors):
+        pass
+
     def step(self, sensors):
         """
         Compute robot control as a function of sensors.
@@ -218,8 +281,25 @@ class StudentController:
 
         estimated_pose = self.mu.tolist()
         print(estimated_pose)
+
+        if self.first_step:
+            sensors["goal"][0][0]
+            self.goal_coords = self.map["goal"][0]       # whichever goal we're facing on startup should be the goal we want to score in (risky)
+            self.first_step = False
+
         
-        control_dict = self.controller(sensors)
+        best_ds, best_dtheta = self.mpc(sensors)
+
+        gain_ds = MAX_SPEED / max(self.ds_candidates)
+        gain_dtheta = MAX_SPEED / max(self.dtheta_candidates)
+
+        forward = gain_ds * best_ds
+        turn = gain_dtheta * best_dtheta
+    
+        control_dict["left_motor"] = forward - turn
+        control_dict["right_motor"] = forward + turn
+
+        # control_dict = self.pid_controller(sensors)
 
         # if (1.5 < self.mu[2] < 1.6):
         #     control_dict["left_motor"] = 6.5
