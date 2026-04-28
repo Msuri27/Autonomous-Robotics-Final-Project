@@ -3,30 +3,8 @@
 import math
 import numpy as np
 
-KP = 2.0
-KI = 0.0
-KD = 0.0
-
-KP_BALL = 2.0
-
-K_PATH = 0.05
-MAX_CORR = 0.08
-
 SET_SPEED = 6.5
 MAX_SPEED = 6.5
-
-ALPHA = 0.8
-
-W_PATH = 500.0
-W_GOAL = 0.1
-W_CONTACT = 0.5
-W_BEARING = 30.0
-K_BALL_PATH = 2.0
-
-TIME_HORIZON = 20
-APPROACH_DISTANCE = 0.6
-CONTACT_DISTANCE = 0.12
-CONTACT_OFFSET = 0.3   # distance behind ball (tune 0.25–0.4)
 
 STAGING_OFFSET = 0.25
 STAGING_TOL = 0.35
@@ -194,85 +172,6 @@ class StudentController:
                         self.ekf_update(x_j, y_j, r_meas, phi_meas)
                 except:
                     pass
-    
-    def mpc_predict(self, sensors, ds, dtheta):
-        x_r, y_r, theta_r = self.mu
-        r_ball, phi_ball = sensors["ball"]
-
-        x_b = x_r + r_ball * np.cos(theta_r + phi_ball)
-        y_b = y_r + r_ball * np.sin(theta_r + phi_ball)
-
-        running_cost = 0.0
-        counter = 0
-        while(counter < TIME_HORIZON):
-            x_r_next = x_r + ds * np.cos(theta_r)
-            y_r_next = y_r + ds * np.sin(theta_r)
-            theta_r_next = self.wrap(theta_r + dtheta)
-
-            dist_to_ball = np.hypot(x_b - x_r, y_b - y_r)
-            dist_to_ball_next = np.hypot(x_b - x_r_next, y_b - y_r_next)
-
-            if min(dist_to_ball, dist_to_ball_next) < CONTACT_DISTANCE:
-                x_b_next = x_b + ds * ALPHA * np.cos(theta_r_next)
-                y_b_next = y_b + ds * ALPHA * np.sin(theta_r_next)
-            else:
-                x_b_next = x_b
-                y_b_next = y_b
-
-            running_cost += self.mpc_cost_function([x_r_next, y_r_next, theta_r_next, x_b_next, y_b_next])
-
-            x_r = x_r_next
-            y_r = y_r_next
-            theta_r = theta_r_next
-            x_b = x_b_next
-            y_b = y_b_next
-
-            counter += 1
-
-        # return full state
-        return running_cost
-        
-    def mpc_cost_function(self, predicted_state):
-        x_r, y_r, theta_r, x_b, y_b = predicted_state
-
-        # path term (keep ball on y = 0), change to different trajectory later
-        path_cost = W_PATH * (y_b ** 2)
-
-        # goal term (push ball toward +x)
-        goal_cost = W_GOAL * (self.goal_coords[0] - x_b) ** 2
-
-        # contact geometry term (robot behind ball)
-        # desired push direction (for now: straight toward goal)
-        push_angle = 0.0
-
-        # where robot should be relative to ball
-        angle_to_ball = np.arctan2(y_b - y_r, x_b - x_r)
-        phi_pred = self.wrap(angle_to_ball - theta_r)
-
-        desired_phi = -K_BALL_PATH * y_b
-        desired_phi = max(-0.35, min(0.35, desired_phi))
-
-        bearing_cost = W_BEARING * (self.wrap(phi_pred - desired_phi) ** 2)
-
-        return path_cost + goal_cost + bearing_cost
-    
-    def mpc(self, sensors):
-        all_running_costs = []
-
-        for ds_candidate in self.ds_candidates:
-            for dtheta_candidate in self.dtheta_candidates:
-                cost = self.mpc_predict(sensors, ds_candidate, dtheta_candidate)
-                all_running_costs.append((ds_candidate, dtheta_candidate, cost))
-    
-        lowest_cost = np.inf
-        best_candidate = (0, 0)
-        for candidate in all_running_costs:
-            if candidate[2] < lowest_cost:
-                lowest_cost = candidate[2]
-                best_candidate = (candidate[0], candidate[1])
-            # print(candidate)
-        
-        return best_candidate
 
     def find_ball(self, sensors):
         try:
