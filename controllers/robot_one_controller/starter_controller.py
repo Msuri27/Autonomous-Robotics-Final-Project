@@ -3,22 +3,23 @@
 import math
 import numpy as np
 
-SET_SPEED = 6.5
 MAX_SPEED = 6.5
 
-STAGING_OFFSET = 0.25
-STAGING_TOL = 0.35
-ANGLE_TOL = 0.08
-BALL_CENTER_TOL = 0.12
+# Line-of-action staging
+LOA_OFFSET = 0.5       # distance behind ball toward opposite side of goal
+STAGING_TOL = 0.2      # how close robot must get to offset point
+FREEZE_DISTANCE = 0.45
+
+# Turning thresholds
+ANGLE_TOL = 0.06        # heading tolerance for turn-in-place states
+
+# Goal/end condition
 GOAL_REACHED_DIST = 0.25
 
-KP_STAGE_HEADING = 2.5
-KP_ALIGN = 2.0
-KP_PUSH = 2.0
-
-STAGE_SPEED = 3.0
-ALIGN_SPEED = 0.5
-PUSH_SPEED = 6.5
+# Speeds
+TURN_SPEED = 2.0        # in-place turning speed
+STAGE_SPEED = 2.0       # drive-to-offset speed
+PUSH_SPEED = 5.0        # final push speed
 
 class StudentController:
     def __init__(self):
@@ -36,26 +37,20 @@ class StudentController:
             "corners": [(-4.5, 3), (-4.5, -3), (4.5, 3), (4.5, -3)]
         }
 
-        # pid integral error
-        self.integral_error = 0.0
-        self.previous_error = 0.0
-
-        # path
-        self.desired_path_angle = 0.0
-        self.desired_path_point = (0.0, 0.0)
-        self.prev_e_path = 0.0
-
-        self.right_speed = SET_SPEED
-        self.left_speed = SET_SPEED
-
-        self.first_step = True
-        self.goal_coords = (4.5, 0)       # NOTE: this must be changed later because the goal could be the other goal in 1v1
+        self.goal_coords = np.array([4.5, 0.0])       # NOTE: this must be changed later because the goal could be the other goal in 1v1
 
         self.ds_candidates = [0.05, 0.07, 0.10]
         self.dtheta_candidates = [-0.25, -0.12, 0.0, 0.12, 0.25]
 
         self.global_r_ball = 0
         self.global_phi_ball = 0
+
+        self.prev_side_error = None
+        self.drive_line_ball = None
+        self.drive_line_unit = None
+        self.drive_offset_point = None
+        self.drive_line_angle = None
+        self.initial_side_error = None
 
     def wrap(self, angle):
         return np.arctan2(np.sin(angle), np.cos(angle))
@@ -173,145 +168,171 @@ class StudentController:
                 except:
                     pass
 
-    def find_ball(self, sensors):
-        try:
-            r_ball, phi_ball = sensors["ball"]
-            self.finite_state = "GO_TO_STAGING_POINT"
-            return {"left_motor": 0.0, "right_motor": 0.0}
-        except:
-            left_motor = -6.5
-            right_motor = 6.5
+    def get_ball_polar_coords(self, sensors):
+        ball_obs = sensors.get("ball", None)
+        if ball_obs is not None:
+            self.global_r_ball, self.global_phi_ball = ball_obs
+        return self.global_r_ball, self.global_phi_ball
 
-            return {
-                "left_motor": left_motor,
-                "right_motor": right_motor
-            }
 
-    
-    def get_ball_global(self, sensors):
+    def get_ball_coords(self, sensors):
         x_r, y_r, theta_r = self.mu
+        r_ball, phi_ball = self.get_ball_polar_coords(sensors)
 
-        try:
-            r_ball, phi_ball = sensors["ball"]
+        bearing = theta_r + phi_ball
+        return np.array([
+            x_r + r_ball * np.cos(bearing),
+            y_r + r_ball * np.sin(bearing)
+        ])
 
-            self.global_r_ball = r_ball
-            self.global_phi_ball = phi_ball
-        except:
-            pass
-
-        bearing = theta_r + self.global_phi_ball
-        x_b = x_r + self.global_r_ball * np.cos(bearing)
-        y_b = y_r + self.global_r_ball * np.sin(bearing)
-
-        return x_b, y_b
-
-
-    def get_line_of_action(self, sensors):
-        x_b, y_b = self.get_ball_global(sensors)
-
-        ball = np.array([x_b, y_b])
+    def get_loa_geometry(self, sensors):
+        ball = self.get_ball_coords(sensors)
         goal = np.array(self.goal_coords)
 
-        line_vec = goal - ball
-        norm = np.linalg.norm(line_vec)
+        loa_vec = goal - ball
+        norm = np.linalg.norm(loa_vec)
 
         if norm < 1e-6:
-            line_dir = np.array([1.0, 0.0])
+            loa_unit = np.array([1.0, 0.0])
         else:
-            line_dir = line_vec / norm
+            loa_unit = loa_vec / norm
 
-        staging = ball - STAGING_OFFSET * line_dir
-        line_angle = np.arctan2(line_dir[1], line_dir[0])
+        offset_point = ball - LOA_OFFSET * loa_unit
+        loa_angle = np.arctan2(loa_unit[1], loa_unit[0])
 
-        return x_b, y_b, staging, line_angle
+        return ball, loa_unit, offset_point, loa_angle
 
-    def go_to_staging_point(self, sensors):
-        x_b, y_b, staging, line_angle = self.get_line_of_action(sensors)
+    def find_ball(self, sensors):
+        ball_obs = sensors.get("ball", None)
+
+        if ball_obs is None:
+            return {"left_motor": -MAX_SPEED, "right_motor": MAX_SPEED}
+
+        self.global_r_ball, self.global_phi_ball = ball_obs
+        self.finite_state = "TURN_TO_OFFSET"
+
+        return {"left_motor": 0.0, "right_motor": 0.0}
+
+
+    def turn_to_offset(self, sensors):
+        ball, loa_unit, offset_point, loa_angle = self.get_loa_geometry(sensors)
 
         x_r, y_r, theta_r = self.mu
+        dx = offset_point[0] - x_r
+        dy = offset_point[1] - y_r
 
-        dx = staging[0] - x_r
-        dy = staging[1] - y_r
-
-        dist = np.hypot(dx, dy)
         target_angle = np.arctan2(dy, dx)
         heading_error = self.wrap(target_angle - theta_r)
 
-        turn = KP_STAGE_HEADING * heading_error
-        turn = max(-0.35 * MAX_SPEED, min(0.35 * MAX_SPEED, turn))
+        if abs(heading_error) < ANGLE_TOL:
+            self.drive_line_frozen = False
+            self.initial_side_error = None
+            self.finite_state = "DRIVE_TO_OFFSET"
+            return {"left_motor": 0.0, "right_motor": 0.0}
 
-        forward = STAGE_SPEED
-
-        if dist < STAGING_TOL:
-            self.finite_state = "ALIGN_TO_LINE"
-
-        left = forward - turn
-        right = forward + turn
+        direction = 1.0 if heading_error > 0 else -1.0
 
         return {
-            "left_motor": max(-MAX_SPEED, min(MAX_SPEED, left)),
-            "right_motor": max(-MAX_SPEED, min(MAX_SPEED, right))
+            "left_motor": -direction * TURN_SPEED,
+            "right_motor": direction * TURN_SPEED
         }
 
+    def drive_to_offset(self, sensors):
+        x_r, y_r, theta_r = self.mu
+        robot = np.array([x_r, y_r])
 
-    def align_to_line(self, sensors):
-        x_b, y_b, staging, line_angle = self.get_line_of_action(sensors)
+        live_ball, live_loa_unit, live_offset_point, live_loa_angle = self.get_loa_geometry(sensors)
+        dist_to_ball = np.linalg.norm(live_ball - robot)
+
+        if not self.drive_line_frozen and dist_to_ball < FREEZE_DISTANCE:
+            self.drive_line_frozen = True
+            self.drive_line_ball = live_ball
+            self.drive_line_unit = live_loa_unit
+            self.drive_offset_point = live_offset_point
+            self.drive_line_angle = live_loa_angle
+
+            robot_vec = robot - self.drive_line_ball
+            self.initial_side_error = (
+                self.drive_line_unit[0] * robot_vec[1]
+                - self.drive_line_unit[1] * robot_vec[0]
+            )
+
+        if self.drive_line_frozen:
+            ball = self.drive_line_ball
+            loa_unit = self.drive_line_unit
+            offset_point = self.drive_offset_point
+
+            robot_vec = robot - ball
+            current_side_error = (
+                loa_unit[0] * robot_vec[1]
+                - loa_unit[1] * robot_vec[0]
+            )
+
+            crossed_line = (
+                self.initial_side_error is not None
+                and current_side_error * self.initial_side_error <= 0
+            )
+
+            dist_to_offset = np.linalg.norm(offset_point - robot)
+
+            if crossed_line or dist_to_offset < STAGING_TOL:
+                self.drive_line_frozen = False
+                self.initial_side_error = None
+                self.finite_state = "TURN_TO_LOA"
+                return {"left_motor": 0.0, "right_motor": 0.0}
+
+        return {
+            "left_motor": STAGE_SPEED,
+            "right_motor": STAGE_SPEED
+    }
+
+    def turn_to_loa(self, sensors):
+        if self.drive_line_angle is not None:
+            loa_angle = self.drive_line_angle
+        else:
+            _, _, _, loa_angle = self.get_loa_geometry(sensors)
 
         theta_r = self.mu[2]
+        heading_error = self.wrap(loa_angle - theta_r)
 
-        heading_error = self.wrap(line_angle - theta_r)
-
-        # Also keep ball centered while aligning
-        error = heading_error + 0.5 * self.global_phi_ball
-
-        turn = KP_ALIGN * error
-        turn = max(-0.25 * MAX_SPEED, min(0.25 * MAX_SPEED, turn))
-
-        forward = ALIGN_SPEED
-
-        if abs(heading_error) < ANGLE_TOL and abs(self.global_phi_ball) < BALL_CENTER_TOL:
+        if abs(heading_error) < ANGLE_TOL:
             self.finite_state = "PUSH_BALL"
+            return {"left_motor": 0.0, "right_motor": 0.0}
 
-        left = forward - turn
-        right = forward + turn
+        direction = 1.0 if heading_error > 0 else -1.0
 
         return {
-            "left_motor": max(-MAX_SPEED, min(MAX_SPEED, left)),
-            "right_motor": max(-MAX_SPEED, min(MAX_SPEED, right))
+            "left_motor": -direction * TURN_SPEED,
+            "right_motor": direction * TURN_SPEED
         }
-
 
     def push_ball(self, sensors):
-        x_b, y_b, staging, line_angle = self.get_line_of_action(sensors)
+        _, _, _, loa_angle = self.get_loa_geometry(sensors)
 
         theta_r = self.mu[2]
+        heading_error = self.wrap(loa_angle - theta_r)
 
-        heading_error = self.wrap(line_angle - theta_r)
+        # tiny correction only
+        turn = 1.0 * heading_error
+        turn = max(-0.5, min(0.5, turn))
 
-        # Primary: keep ball centered. Secondary: stay on line angle.
-        error = self.global_phi_ball + 0.3 * heading_error
+        left = PUSH_SPEED - turn
+        right = PUSH_SPEED + turn
 
-        turn = KP_PUSH * error
-        turn = max(-0.15 * MAX_SPEED, min(0.15 * MAX_SPEED, turn))
-
-        forward = PUSH_SPEED
-
-        goal_dist = np.hypot(self.goal_coords[0] - x_b, self.goal_coords[1] - y_b)
-
-        if goal_dist < GOAL_REACHED_DIST:
-            self.finite_state = "DONE"
-
-        # If ball gets badly off-center, recover by going back to staging
-        if abs(self.global_phi_ball) > 0.45:
-            self.finite_state = "GO_TO_STAGING_POINT"
-
-        left = forward - turn
-        right = forward + turn
+        ball_obs = sensors.get("ball", None)
+        if ball_obs is None:
+            self.finite_state = "BACK_UP"
 
         return {
             "left_motor": max(-MAX_SPEED, min(MAX_SPEED, left)),
             "right_motor": max(-MAX_SPEED, min(MAX_SPEED, right))
         }
+    
+    def back_up(self, sensors):
+        ball_obs = sensors.get("ball", None)
+        if ball_obs is not None:
+            self.finite_state = "FIND_BALL"
+        return {"left_motor": -MAX_SPEED, "right_motor": -MAX_SPEED}
 
     def step(self, sensors):
         """
@@ -337,14 +358,20 @@ class StudentController:
             case "FIND_BALL":
                 control_dict = self.find_ball(sensors)
 
-            case "GO_TO_STAGING_POINT":
-                control_dict = self.go_to_staging_point(sensors)
+            case "TURN_TO_OFFSET":
+                control_dict = self.turn_to_offset(sensors)
 
-            case "ALIGN_TO_LINE":
-                control_dict = self.align_to_line(sensors)
+            case "DRIVE_TO_OFFSET":
+                control_dict = self.drive_to_offset(sensors)
+
+            case "TURN_TO_LOA":
+                control_dict = self.turn_to_loa(sensors)
 
             case "PUSH_BALL":
                 control_dict = self.push_ball(sensors)
+
+            case "BACK_UP":
+                control_dict = self.back_up(sensors)
 
             case "DONE":
                 control_dict = {"left_motor": 0.0, "right_motor": 0.0}
