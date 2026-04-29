@@ -6,9 +6,9 @@ import numpy as np
 MAX_SPEED = 6.5
 
 # Line-of-action staging
-LOA_OFFSET = 0.5       # distance behind ball toward opposite side of goal
-STAGING_TOL = 0.2      # how close robot must get to offset point
-FREEZE_DISTANCE = 0.45
+LOA_OFFSET = 0.75       # distance behind ball toward opposite side of goal
+STAGING_TOL = 0.15      # how close robot must get to offset point
+FREEZE_DISTANCE = 0.8
 
 # Turning thresholds
 ANGLE_TOL = 0.06        # heading tolerance for turn-in-place states
@@ -251,6 +251,8 @@ class StudentController:
             self.drive_offset_point = live_offset_point
             self.drive_line_angle = live_loa_angle
 
+            print(f"FROZEN_OFFSET_POINT: {live_offset_point}")
+
             robot_vec = robot - self.drive_line_ball
             self.initial_side_error = (
                 self.drive_line_unit[0] * robot_vec[1]
@@ -263,16 +265,14 @@ class StudentController:
             offset_point = self.drive_offset_point
 
             robot_vec = robot - ball
-            current_side_error = (
-                loa_unit[0] * robot_vec[1]
-                - loa_unit[1] * robot_vec[0]
-            )
+            current_side_error = loa_unit[0] * robot_vec[1] - loa_unit[1] * robot_vec[0]
 
             crossed_line = (
                 self.initial_side_error is not None
                 and current_side_error * self.initial_side_error <= 0
             )
 
+            print(f"FROZEN_OFFSET_POINT: {offset_point}")
             dist_to_offset = np.linalg.norm(offset_point - robot)
 
             if crossed_line or dist_to_offset < STAGING_TOL:
