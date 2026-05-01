@@ -46,8 +46,15 @@ class StudentController:
             "corners": [(-4.5, 3), (-4.5, -3), (4.5, 3), (4.5, -3)]
         }
 
-        # Goal
-        self.goal_coords = np.array([4.5, 0.0])
+        # Goal / attack direction
+        self.goal_initialized = False
+        self.attack_sign = 1.0          # +1 means attack right goal, -1 means attack left goal
+        self.goal_x_abs = 4.5
+        self.goal_coords = np.array([self.goal_x_abs, 0.0])
+
+        # Recovery target settings (in attack frame)
+        self.recovery_switch_x = 3.5
+        self.goal_deadzone_x = 4.65
 
         # Last known ball observation
         self.global_r_ball = 0.0
@@ -92,6 +99,37 @@ class StudentController:
 
         self.state_steps = 0
         self.prev_state = None
+
+        self.use_recovery_target = False
+        self.recovery_finished = False
+
+    def initialize_attack_goal(self):
+        """
+        Decide once which goal we are attacking based on initial heading.
+        If robot is facing mostly +x, attack right goal.
+        If robot is facing mostly -x, attack left goal.
+        """
+        if self.goal_initialized:
+            return
+
+        theta = self.mu[2]
+        facing_x = np.cos(theta)
+
+        if facing_x >= 0:
+            self.attack_sign = 1.0
+        else:
+            self.attack_sign = -1.0
+
+        self.goal_coords = np.array([self.attack_sign * self.goal_x_abs, 0.0])
+        self.goal_initialized = True
+
+
+    def to_attack_frame_x(self, x_world):
+        return self.attack_sign * x_world
+
+
+    def from_attack_frame_point(self, x_attack, y_world):
+        return np.array([self.attack_sign * x_attack, y_world])
 
     def wrap(self, angle):
         return np.arctan2(np.sin(angle), np.cos(angle))
@@ -225,12 +263,46 @@ class StudentController:
             x_r + r_ball * np.cos(bearing),
             y_r + r_ball * np.sin(bearing)
         ])
+    
+    def ball_in_goal_deadzone(self, sensors):
+        ball_coords = self.get_ball_coords(sensors)
+        ball_x, ball_y = ball_coords
+
+        ball_x_attack = self.to_attack_frame_x(ball_x)
+
+        return (ball_x_attack > self.goal_deadzone_x) and (-0.7 <= ball_y <= 0.7)
+    
+    def get_active_target(self, sensors):
+        ball_coords = self.get_ball_coords(sensors)
+        ball_x, ball_y = ball_coords
+
+        ball_x_attack = self.to_attack_frame_x(ball_x)
+
+        # if basically scored, always use real goal
+        if self.ball_in_goal_deadzone(sensors):
+            self.use_recovery_target = False
+            self.recovery_finished = True
+            return self.goal_coords
+
+        # hard one-way switch back to goal
+        if self.use_recovery_target and ball_x_attack <= self.recovery_switch_x:
+            self.use_recovery_target = False
+            self.recovery_finished = True
+
+        # once finished, never recover again
+        if self.recovery_finished:
+            return self.goal_coords
+
+        if self.use_recovery_target:
+            return self.from_attack_frame_point(self.recovery_switch_x, 0.0)
+
+        return self.goal_coords
 
     def get_loa_geometry(self, sensors):
         ball = self.get_ball_coords(sensors)
-        goal = np.array(self.goal_coords)
+        target = self.get_active_target(sensors)
 
-        loa_vec = goal - ball
+        loa_vec = target - ball
         norm = np.linalg.norm(loa_vec)
 
         if norm < 1e-6:
@@ -252,33 +324,40 @@ class StudentController:
 
         self.global_r_ball, self.global_phi_ball = ball_obs
 
-        # ONLY do this avoidance decision once at startup
         if not self.startup_checked:
             ball_coords = self.get_ball_coords(sensors)
             ball_x, ball_y = ball_coords
 
-            ball_behind_robot = ball_x < x_r
-            ball_behind_goal = ball_x > self.goal_coords[0]
+            robot_x_attack = self.to_attack_frame_x(x_r)
+            ball_x_attack = self.to_attack_frame_x(ball_x)
+
+            ball_behind_robot = ball_x_attack < robot_x_attack
+            ball_behind_goal = ball_x_attack > self.goal_x_abs
 
             if ball_behind_robot or ball_behind_goal:
                 self.must_avoid = True
 
                 if ball_y >= y_r:
-                    self.avoid_heading = np.pi / 2      # 90 deg, go up
+                    self.avoid_heading = np.pi / 2
                     self.avoid_target_y = ball_y + self.avoid_cushion
                 else:
-                    self.avoid_heading = -np.pi / 2     # 270 deg, go down
+                    self.avoid_heading = -np.pi / 2
                     self.avoid_target_y = ball_y - self.avoid_cushion
 
                 self.finite_state = "DRIVE_TO_POINT"
             else:
-                self.must_avoid = False
+                # decide once whether temporary center target is needed
+                if ball_x_attack > self.recovery_switch_x:
+                    self.use_recovery_target = True
+                else:
+                    self.use_recovery_target = False
+                    self.recovery_finished = True
+
                 self.finite_state = "TURN_TO_OFFSET"
 
             self.startup_checked = True
             return {"left_motor": 0.0, "right_motor": 0.0}
 
-        # after startup check, just continue normal behavior
         self.finite_state = "TURN_TO_OFFSET"
         return {"left_motor": 0.0, "right_motor": 0.0}
     
@@ -294,7 +373,6 @@ class StudentController:
 
         if abs(heading_error) < ANGLE_TOL:
             self.drive_line_frozen = False
-            self.initial_side_error = None
             self.finite_state = "DRIVE_TO_OFFSET"
             return {"left_motor": 0.0, "right_motor": 0.0}
 
@@ -385,9 +463,10 @@ class StudentController:
         live_ball, live_loa_unit, live_offset_point, live_loa_angle = self.get_loa_geometry(sensors)
         dist_to_ball = np.linalg.norm(live_ball - robot)
 
-        ball_x = live_ball[0]
+        ball_x_attack = self.to_attack_frame_x(live_ball[0])
+        robot_x_attack = self.to_attack_frame_x(x_r)
 
-        if (not self.refind_used) and (x_r < ball_x - self.refind_margin):
+        if (not self.refind_used) and (robot_x_attack < ball_x_attack - self.refind_margin):
             self.refind_used = True
             self.drive_line_frozen = False
             self.initial_line_error = None
@@ -487,7 +566,6 @@ class StudentController:
         theta_r = self.mu[2]
         heading_error = self.wrap(loa_angle - theta_r)
 
-        # tiny correction only
         turn = 1.0 * heading_error
         turn = max(-0.5, min(0.5, turn))
 
@@ -497,8 +575,10 @@ class StudentController:
         ball_obs = sensors.get("ball", None)
         if ball_obs is None:
             self.finite_state = "BACK_UP"
-        ball_coords = self.get_ball_coords(sensors)
-        if ball_coords[0] > (self.goal_coords[0] + 0.1) and -0.7 < ball_coords[1] < 0.7:
+
+        if self.ball_in_goal_deadzone(sensors):
+            self.use_recovery_target = False
+            self.recovery_finished = True
             self.finite_state = "DONE"
 
         return {
@@ -642,6 +722,7 @@ class StudentController:
 
         self.ekf_prediction(sensors)
         self.feature_match(sensors)
+        self.initialize_attack_goal()
         self.update_observation_timer(sensors)
 
         print(self.mu.tolist())
@@ -677,7 +758,7 @@ class StudentController:
             case "DONE":
                 control_dict = {"left_motor": 0.0, "right_motor": 0.0}
 
-        # update progress AFTER deciding command
+        # update progress after deciding command
         self.update_progress_history(control_dict)
 
         # normal stuck detection
