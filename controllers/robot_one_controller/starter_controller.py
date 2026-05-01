@@ -6,7 +6,7 @@ import numpy as np
 MAX_SPEED = 6.5
 
 # Line-of-action staging
-LOA_OFFSET = 0.25       # distance behind ball toward opposite side of goal
+LOA_OFFSET = 0.3       # distance behind ball toward opposite side of goal
 STAGING_TOL = 0.15      # how close robot must get to offset point
 FREEZE_DISTANCE = 0.8
 LINE_TOL = 0.08
@@ -18,8 +18,8 @@ ANGLE_TOL = 0.06        # heading tolerance for turn-in-place states
 GOAL_REACHED_DIST = 0.25
 
 # Speeds
-TURN_SPEED = 2.0        # in-place turning speed
-STAGE_SPEED = 2.0       # drive-to-offset speed
+TURN_SPEED = 4.0        # in-place turning speed
+STAGE_SPEED = 5.0       # drive-to-offset speed
 PUSH_SPEED = 5.0        # final push speed
 
 class StudentController:
@@ -58,6 +58,42 @@ class StudentController:
         self.frozen_m = 0.0
         self.frozen_b = 0.0
         self.frozen_x = 0.0
+
+        self.must_avoid = False
+
+        self.avoid_mode = "TURN"
+        self.avoid_start_y = None
+        self.avoid_target_heading = None
+        self.avoid_direction = 1.0
+        self.avoid_checked = False
+
+        self.startup_checked = False
+        self.must_avoid = False
+        self.avoid_heading = None
+        self.avoid_target_y = None
+        self.avoid_cushion = 0.5
+
+        self.refind_used = False
+        self.refind_margin = 0.15
+
+        self.prev_stuck_pose = None
+        self.stuck_counter = 0
+        self.backup_start_pose = None
+
+        self.stuck_pos_tol = 0.01      # meters per step
+        self.stuck_theta_tol = 0.02    # radians per step
+        self.stuck_steps_needed = 30   # about 0.5 sec at 32 ms
+
+        self.backup_distance = 0.25
+
+        self.steps_since_observation = 0
+        self.observation_timeout_steps = int(20.0 / 0.032)   # ~30 seconds at 32 ms timestep
+
+        self.pose_history = []
+        self.stuck_window_steps = int(10.0 / 0.032)   # 10 seconds
+        self.stuck_net_disp_tol = 0.25                # meters over window
+        self.steps_since_observation = 0
+        self.observation_timeout_steps = int(10.0 / 0.032)
 
     def wrap(self, angle):
         return np.arctan2(np.sin(angle), np.cos(angle))
@@ -211,16 +247,43 @@ class StudentController:
 
     def find_ball(self, sensors):
         ball_obs = sensors.get("ball", None)
+        x_r, y_r, _ = self.mu
 
         if ball_obs is None:
             return {"left_motor": -MAX_SPEED, "right_motor": MAX_SPEED}
 
         self.global_r_ball, self.global_phi_ball = ball_obs
+
+        # ONLY do this avoidance decision once at startup
+        if not self.startup_checked:
+            ball_coords = self.get_ball_coords(sensors)
+            ball_x, ball_y = ball_coords
+
+            ball_behind_robot = ball_x < x_r
+            ball_behind_goal = ball_x > self.goal_coords[0]
+
+            if ball_behind_robot or ball_behind_goal:
+                self.must_avoid = True
+
+                if ball_y >= y_r:
+                    self.avoid_heading = np.pi / 2      # 90 deg, go up
+                    self.avoid_target_y = ball_y + self.avoid_cushion
+                else:
+                    self.avoid_heading = -np.pi / 2     # 270 deg, go down
+                    self.avoid_target_y = ball_y - self.avoid_cushion
+
+                self.finite_state = "DRIVE_TO_POINT"
+            else:
+                self.must_avoid = False
+                self.finite_state = "TURN_TO_OFFSET"
+
+            self.startup_checked = True
+            return {"left_motor": 0.0, "right_motor": 0.0}
+
+        # after startup check, just continue normal behavior
         self.finite_state = "TURN_TO_OFFSET"
-
         return {"left_motor": 0.0, "right_motor": 0.0}
-
-
+    
     def turn_to_offset(self, sensors):
         ball, loa_unit, offset_point, loa_angle = self.get_loa_geometry(sensors)
 
@@ -244,6 +307,79 @@ class StudentController:
             "right_motor": direction * TURN_SPEED
         }
 
+    def compute_drive_point(self, sensors):
+        x_r, y_r, theta_r = self.mu
+
+        if self.avoid_heading is None or self.avoid_target_y is None:
+            self.must_avoid = False
+            self.finite_state = "FIND_BALL"
+            return {"left_motor": 0.0, "right_motor": 0.0}
+
+        heading_error = self.wrap(self.avoid_heading - theta_r)
+
+        # Step 1: turn in place to vertical
+        if abs(heading_error) > 0.12:
+            if heading_error > 0:
+                return {
+                    "left_motor": -TURN_SPEED,
+                    "right_motor": TURN_SPEED
+                }
+            else:
+                return {
+                    "left_motor": TURN_SPEED,
+                    "right_motor": -TURN_SPEED
+                }
+
+        # Step 2: drive straight vertically until target y is reached
+        if self.avoid_heading > 0:  # going up
+            reached_target = y_r >= self.avoid_target_y
+        else:                       # going down
+            reached_target = y_r <= self.avoid_target_y
+
+        if reached_target:
+            self.must_avoid = False
+            self.avoid_heading = None
+            self.avoid_target_y = None
+            self.finite_state = "FIND_BALL"
+            return {"left_motor": 0.0, "right_motor": 0.0}
+
+        return {
+            "left_motor": STAGE_SPEED,
+            "right_motor": STAGE_SPEED
+        }
+
+    def drive_to_point(self, target_point):
+        x_r, y_r, theta_r = self.mu
+        target = np.array(target_point)
+
+        dx = target[0] - x_r
+        dy = target[1] - y_r
+        dist = np.hypot(dx, dy)
+
+        target_angle = np.arctan2(dy, dx)
+        heading_error = self.wrap(target_angle - theta_r)
+
+        # turn in place first
+        if abs(heading_error) > ANGLE_TOL:
+            direction = 1.0 if heading_error > 0 else -1.0
+            return {
+                "left_motor": -direction * TURN_SPEED,
+                "right_motor": direction * TURN_SPEED
+            }, False
+
+        # close enough
+        if dist < STAGING_TOL:
+            return {
+                "left_motor": 0.0,
+                "right_motor": 0.0
+            }, True
+
+        # drive straight once aligned
+        return {
+            "left_motor": STAGE_SPEED,
+            "right_motor": STAGE_SPEED
+        }, False
+
     def drive_to_offset(self, sensors):
         x_r, y_r, theta_r = self.mu
         robot = np.array([x_r, y_r])
@@ -251,10 +387,19 @@ class StudentController:
         live_ball, live_loa_unit, live_offset_point, live_loa_angle = self.get_loa_geometry(sensors)
         dist_to_ball = np.linalg.norm(live_ball - robot)
 
-        # wall collision avoidance:
-        # if x_r < -5.0 or x_r > 5.0 or y_r < -5.0 or y_r > 5.0:
-        #     self.finite_state = "FIND_BALL"
+        ball_x = live_ball[0]
 
+        if (not self.refind_used) and (x_r < ball_x - self.refind_margin):
+            self.refind_used = True
+            self.drive_line_frozen = False
+            self.initial_line_error = None
+            self.finite_state = "FIND_BALL"
+            return {"left_motor": 0.0, "right_motor": 0.0}
+
+        if self.must_avoid:
+            self.finite_state = "DRIVE_TO_POINT"
+            return {"left_motor": 0.0, "right_motor": 0.0}
+        
         if not self.drive_line_frozen and dist_to_ball < FREEZE_DISTANCE:
             self.drive_line_frozen = True
             self.drive_line_ball = live_ball
@@ -369,6 +514,74 @@ class StudentController:
             self.finite_state = "FIND_BALL"
         return {"left_motor": -MAX_SPEED, "right_motor": -MAX_SPEED}
 
+    def check_stuck(self):
+        x_r, y_r, theta_r = self.mu
+
+        if self.prev_stuck_pose is None:
+            self.prev_stuck_pose = np.array([x_r, y_r, theta_r])
+            return False
+
+        dx = x_r - self.prev_stuck_pose[0]
+        dy = y_r - self.prev_stuck_pose[1]
+        dpos = np.hypot(dx, dy)
+        dtheta = abs(self.wrap(theta_r - self.prev_stuck_pose[2]))
+
+        self.prev_stuck_pose = np.array([x_r, y_r, theta_r])
+
+        if dpos < self.stuck_pos_tol and dtheta < self.stuck_theta_tol:
+            self.stuck_counter += 1
+        else:
+            self.stuck_counter = 0
+
+        return self.stuck_counter >= self.stuck_steps_needed
+    
+    def back_up_recover(self, sensors):
+        x_r, y_r, _ = self.mu
+
+        if self.backup_start_pose is None:
+            self.backup_start_pose = np.array([x_r, y_r])
+
+        dist = np.linalg.norm(np.array([x_r, y_r]) - self.backup_start_pose)
+
+        if dist >= self.backup_distance:
+            self.backup_start_pose = None
+            self.stuck_counter = 0
+            self.prev_stuck_pose = None
+            self.finite_state = "FIND_BALL"
+            return {"left_motor": 0.0, "right_motor": 0.0}
+
+        return {
+            "left_motor": -STAGE_SPEED,
+            "right_motor": -STAGE_SPEED
+        }
+    
+    def update_observation_timer(self, sensors):
+        saw_anything = False
+
+        # ball counts
+        if sensors.get("ball", None) is not None:
+            saw_anything = True
+
+        # landmarks count
+        for key in ["center_circle", "goal", "penalty_cross", "corners"]:
+            if key in sensors:
+                try:
+                    val = sensors[key]
+                    if val is not None:
+                        if key == "center_circle":
+                            if len(val) == 2:
+                                saw_anything = True
+                        else:
+                            if len(val) > 0:
+                                saw_anything = True
+                except:
+                    pass
+
+        if saw_anything:
+            self.steps_since_observation = 0
+        else:
+            self.steps_since_observation += 1
+
     def step(self, sensors):
         """
         Compute robot control as a function of sensors.
@@ -383,11 +596,21 @@ class StudentController:
 
         self.ekf_prediction(sensors)
         self.feature_match(sensors)
+        self.update_observation_timer(sensors)
 
         estimated_pose = self.mu.tolist()
         print(estimated_pose)
-
         print(self.finite_state)
+
+        if self.finite_state in ["TURN_TO_OFFSET", "DRIVE_TO_OFFSET", "TURN_TO_LOA", "PUSH_BALL"]:
+            if self.check_stuck():
+                self.finite_state = "BACK_UP_RECOVER"
+                self.backup_start_pose = None
+        
+        if self.steps_since_observation > self.observation_timeout_steps:
+            self.finite_state = "BACK_UP_RECOVER"
+            self.backup_start_pose = None
+            self.steps_since_observation = 0
 
         match self.finite_state:
             case "FIND_BALL":
@@ -399,6 +622,9 @@ class StudentController:
             case "DRIVE_TO_OFFSET":
                 control_dict = self.drive_to_offset(sensors)
 
+            case "DRIVE_TO_POINT":
+                control_dict = self.compute_drive_point(sensors)
+
             case "TURN_TO_LOA":
                 control_dict = self.turn_to_loa(sensors)
 
@@ -407,6 +633,9 @@ class StudentController:
 
             case "BACK_UP":
                 control_dict = self.back_up(sensors)
+
+            case "BACK_UP_RECOVER":
+                control_dict = self.back_up_recover(sensors)
 
             case "DONE":
                 control_dict = {"left_motor": 0.0, "right_motor": 0.0}
