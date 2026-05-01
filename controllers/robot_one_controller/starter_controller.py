@@ -22,78 +22,76 @@ TURN_SPEED = 4.0        # in-place turning speed
 STAGE_SPEED = 5.0       # drive-to-offset speed
 PUSH_SPEED = 5.0        # final push speed
 
+TIME_STEP = 0.032
+WHEEL_SPEED_TO_MPS = 0.166 / 5.0   # ≈ 0.0332 m/s per wheel-speed unit
+PROGRESS_WINDOW_SEC = 10.0
+PROGRESS_WINDOW_STEPS = int(PROGRESS_WINDOW_SEC / TIME_STEP)
+
+PROGRESS_TOL_RATIO = 0.35          # actual must be at least 35% of expected
+MIN_COMMAND_SPEED = 2.0            # ignore tiny commands / turning noise
+
 class StudentController:
     def __init__(self):
         self.finite_state = "FIND_BALL"
-        
-        # ekf
+
+        # EKF state
         self.mu = np.array([0.0, 0.0, 0.0])
         self.Sigma = np.diag([0.1, 0.1, 1.0])
 
-        # landmark map for feature matching
+        # Landmark map
         self.map = {
-            "center_circle": [(0,0)],
+            "center_circle": [(0, 0)],
             "goal": [(4.5, 0), (-4.5, 0)],
             "penalty_cross": [(3.25, 0), (-3.25, 0)],
             "corners": [(-4.5, 3), (-4.5, -3), (4.5, 3), (4.5, -3)]
         }
 
-        self.goal_coords = np.array([4.5, 0.0])       # NOTE: this must be changed later because the goal could be the other goal in 1v1
+        # Goal
+        self.goal_coords = np.array([4.5, 0.0])
 
-        self.ds_candidates = [0.05, 0.07, 0.10]
-        self.dtheta_candidates = [-0.25, -0.12, 0.0, 0.12, 0.25]
+        # Last known ball observation
+        self.global_r_ball = 0.0
+        self.global_phi_ball = 0.0
 
-        self.global_r_ball = 0
-        self.global_phi_ball = 0
-
-        self.prev_side_error = None
-        self.drive_line_ball = None
-        self.drive_line_unit = None
-        self.drive_offset_point = None
-        self.drive_line_angle = None
-        self.initial_side_error = None
-
-        self.initial_line_error = None
-        self.frozen_line_vertical = False
-        self.frozen_m = 0.0
-        self.frozen_b = 0.0
-        self.frozen_x = 0.0
-
-        self.must_avoid = False
-
-        self.avoid_mode = "TURN"
-        self.avoid_start_y = None
-        self.avoid_target_heading = None
-        self.avoid_direction = 1.0
-        self.avoid_checked = False
-
+        # Startup avoid maneuver
         self.startup_checked = False
         self.must_avoid = False
         self.avoid_heading = None
         self.avoid_target_y = None
         self.avoid_cushion = 0.5
 
+        # One-time refind trigger while driving to offset
         self.refind_used = False
         self.refind_margin = 0.15
 
-        self.prev_stuck_pose = None
-        self.stuck_counter = 0
+        # Frozen LOA geometry near the ball
+        self.drive_line_frozen = False
+        self.drive_line_ball = None
+        self.drive_line_unit = None
+        self.drive_offset_point = None
+        self.drive_line_angle = None
+
+        # Frozen line equation / crossing check
+        self.initial_line_error = None
+        self.frozen_line_vertical = False
+        self.frozen_m = 0.0
+        self.frozen_b = 0.0
+        self.frozen_x = 0.0
+
+        # Recovery / backup
         self.backup_start_pose = None
-
-        self.stuck_pos_tol = 0.01      # meters per step
-        self.stuck_theta_tol = 0.02    # radians per step
-        self.stuck_steps_needed = 30   # about 0.5 sec at 32 ms
-
         self.backup_distance = 0.25
 
+        # Observation timeout
         self.steps_since_observation = 0
-        self.observation_timeout_steps = int(20.0 / 0.032)   # ~30 seconds at 32 ms timestep
+        self.observation_timeout_steps = PROGRESS_WINDOW_STEPS
 
-        self.pose_history = []
-        self.stuck_window_steps = int(10.0 / 0.032)   # 10 seconds
-        self.stuck_net_disp_tol = 0.25                # meters over window
-        self.steps_since_observation = 0
-        self.observation_timeout_steps = int(10.0 / 0.032)
+        # Progress-based stuck detection
+        self.progress_history = []
+        self.stuck_window_steps = PROGRESS_WINDOW_STEPS
+
+        self.state_steps = 0
+        self.prev_state = None
 
     def wrap(self, angle):
         return np.arctan2(np.sin(angle), np.cos(angle))
@@ -348,37 +346,37 @@ class StudentController:
             "right_motor": STAGE_SPEED
         }
 
-    def drive_to_point(self, target_point):
-        x_r, y_r, theta_r = self.mu
-        target = np.array(target_point)
+    # def drive_to_point(self, target_point):
+    #     x_r, y_r, theta_r = self.mu
+    #     target = np.array(target_point)
 
-        dx = target[0] - x_r
-        dy = target[1] - y_r
-        dist = np.hypot(dx, dy)
+    #     dx = target[0] - x_r
+    #     dy = target[1] - y_r
+    #     dist = np.hypot(dx, dy)
 
-        target_angle = np.arctan2(dy, dx)
-        heading_error = self.wrap(target_angle - theta_r)
+    #     target_angle = np.arctan2(dy, dx)
+    #     heading_error = self.wrap(target_angle - theta_r)
 
-        # turn in place first
-        if abs(heading_error) > ANGLE_TOL:
-            direction = 1.0 if heading_error > 0 else -1.0
-            return {
-                "left_motor": -direction * TURN_SPEED,
-                "right_motor": direction * TURN_SPEED
-            }, False
+    #     # turn in place first
+    #     if abs(heading_error) > ANGLE_TOL:
+    #         direction = 1.0 if heading_error > 0 else -1.0
+    #         return {
+    #             "left_motor": -direction * TURN_SPEED,
+    #             "right_motor": direction * TURN_SPEED
+    #         }, False
 
-        # close enough
-        if dist < STAGING_TOL:
-            return {
-                "left_motor": 0.0,
-                "right_motor": 0.0
-            }, True
+    #     # close enough
+    #     if dist < STAGING_TOL:
+    #         return {
+    #             "left_motor": 0.0,
+    #             "right_motor": 0.0
+    #         }, True
 
-        # drive straight once aligned
-        return {
-            "left_motor": STAGE_SPEED,
-            "right_motor": STAGE_SPEED
-        }, False
+    #     # drive straight once aligned
+    #     return {
+    #         "left_motor": STAGE_SPEED,
+    #         "right_motor": STAGE_SPEED
+    #     }, False
 
     def drive_to_offset(self, sensors):
         x_r, y_r, theta_r = self.mu
@@ -514,27 +512,34 @@ class StudentController:
             self.finite_state = "FIND_BALL"
         return {"left_motor": -MAX_SPEED, "right_motor": -MAX_SPEED}
 
-    def check_stuck(self):
-        x_r, y_r, theta_r = self.mu
+    def update_observation_timer(self, sensors):
+        saw_anything = False
 
-        if self.prev_stuck_pose is None:
-            self.prev_stuck_pose = np.array([x_r, y_r, theta_r])
-            return False
+        if sensors.get("ball", None) is not None:
+            saw_anything = True
 
-        dx = x_r - self.prev_stuck_pose[0]
-        dy = y_r - self.prev_stuck_pose[1]
-        dpos = np.hypot(dx, dy)
-        dtheta = abs(self.wrap(theta_r - self.prev_stuck_pose[2]))
+        center_obs = sensors.get("center_circle", None)
+        if center_obs is not None:
+            try:
+                if len(center_obs) == 2:
+                    saw_anything = True
+            except:
+                pass
 
-        self.prev_stuck_pose = np.array([x_r, y_r, theta_r])
+        for key in ["goal", "penalty_cross", "corners"]:
+            obs = sensors.get(key, None)
+            if obs is not None:
+                try:
+                    if len(obs) > 0:
+                        saw_anything = True
+                except:
+                    pass
 
-        if dpos < self.stuck_pos_tol and dtheta < self.stuck_theta_tol:
-            self.stuck_counter += 1
+        if saw_anything:
+            self.steps_since_observation = 0
         else:
-            self.stuck_counter = 0
+            self.steps_since_observation += 1
 
-        return self.stuck_counter >= self.stuck_steps_needed
-    
     def back_up_recover(self, sensors):
         x_r, y_r, _ = self.mu
 
@@ -543,10 +548,19 @@ class StudentController:
 
         dist = np.linalg.norm(np.array([x_r, y_r]) - self.backup_start_pose)
 
-        if dist >= self.backup_distance:
+        if dist >= 0.25:
             self.backup_start_pose = None
-            self.stuck_counter = 0
-            self.prev_stuck_pose = None
+            self.progress_history = []
+            self.steps_since_observation = 0
+
+            self.drive_line_frozen = False
+            self.initial_line_error = None
+
+            self.drive_line_angle = None
+            self.drive_line_ball = None
+            self.drive_line_unit = None
+            self.drive_offset_point = None
+
             self.finite_state = "FIND_BALL"
             return {"left_motor": 0.0, "right_motor": 0.0}
 
@@ -555,32 +569,64 @@ class StudentController:
             "right_motor": -STAGE_SPEED
         }
     
-    def update_observation_timer(self, sensors):
-        saw_anything = False
+    def commanded_linear_speed_mps(self, control_dict):
+        left = control_dict.get("left_motor", 0.0)
+        right = control_dict.get("right_motor", 0.0)
 
-        # ball counts
-        if sensors.get("ball", None) is not None:
-            saw_anything = True
+        # only count mostly straight motion, not turn-in-place
+        if left * right <= 0:
+            return 0.0
 
-        # landmarks count
-        for key in ["center_circle", "goal", "penalty_cross", "corners"]:
-            if key in sensors:
-                try:
-                    val = sensors[key]
-                    if val is not None:
-                        if key == "center_circle":
-                            if len(val) == 2:
-                                saw_anything = True
-                        else:
-                            if len(val) > 0:
-                                saw_anything = True
-                except:
-                    pass
+        avg_wheel_speed = (abs(left) + abs(right)) / 2.0
+        return avg_wheel_speed * WHEEL_SPEED_TO_MPS
 
-        if saw_anything:
-            self.steps_since_observation = 0
+    def update_progress_history(self, control_dict):
+        x_r, y_r, _ = self.mu
+        commanded_speed = self.commanded_linear_speed_mps(control_dict)
+
+        self.progress_history.append((x_r, y_r, commanded_speed))
+
+        if len(self.progress_history) > PROGRESS_WINDOW_STEPS:
+            self.progress_history.pop(0)
+
+    def check_stuck_by_expected_progress(self):
+        if len(self.progress_history) < PROGRESS_WINDOW_STEPS:
+            return False
+
+        x0, y0, _ = self.progress_history[0]
+        x1, y1, _ = self.progress_history[-1]
+
+        actual_disp = np.hypot(x1 - x0, y1 - y0)
+        avg_cmd_speed = sum(s for _, _, s in self.progress_history) / len(self.progress_history)
+
+        if avg_cmd_speed < MIN_COMMAND_SPEED * WHEEL_SPEED_TO_MPS:
+            return False
+
+        expected_disp = avg_cmd_speed * PROGRESS_WINDOW_SEC
+        ratio = actual_disp / max(expected_disp, 1e-6)
+
+        print(
+            "PROGRESS_CHECK",
+            "actual_disp:", actual_disp,
+            "expected_disp:", expected_disp,
+            "ratio:", ratio,
+            "steps_since_obs:", self.steps_since_observation,
+            "state_steps:", self.state_steps,
+            "state:", self.finite_state
+        )
+
+        bad_progress = ratio < PROGRESS_TOL_RATIO
+        blind_too_long = self.steps_since_observation >= self.observation_timeout_steps
+        state_too_long = self.state_steps >= PROGRESS_WINDOW_STEPS
+
+        return bad_progress and (blind_too_long or state_too_long)
+    
+    def update_state_timer(self):
+        if self.finite_state == self.prev_state:
+            self.state_steps += 1
         else:
-            self.steps_since_observation += 1
+            self.state_steps = 0
+            self.prev_state = self.finite_state
 
     def step(self, sensors):
         """
@@ -598,19 +644,10 @@ class StudentController:
         self.feature_match(sensors)
         self.update_observation_timer(sensors)
 
-        estimated_pose = self.mu.tolist()
-        print(estimated_pose)
+        print(self.mu.tolist())
         print(self.finite_state)
 
-        if self.finite_state in ["TURN_TO_OFFSET", "DRIVE_TO_OFFSET", "TURN_TO_LOA", "PUSH_BALL"]:
-            if self.check_stuck():
-                self.finite_state = "BACK_UP_RECOVER"
-                self.backup_start_pose = None
-        
-        if self.steps_since_observation > self.observation_timeout_steps:
-            self.finite_state = "BACK_UP_RECOVER"
-            self.backup_start_pose = None
-            self.steps_since_observation = 0
+        self.update_state_timer()
 
         match self.finite_state:
             case "FIND_BALL":
@@ -640,10 +677,34 @@ class StudentController:
             case "DONE":
                 control_dict = {"left_motor": 0.0, "right_motor": 0.0}
 
-        # control_dict = self.pid_controller(sensors)
+        # update progress AFTER deciding command
+        self.update_progress_history(control_dict)
 
-        # if (1.5 < self.mu[2] < 1.6):
-        #     control_dict["left_motor"] = 6.5
-        #     control_dict["right_motor"] = 6.5
+        # normal stuck detection
+        if self.finite_state in ["DRIVE_TO_OFFSET", "DRIVE_TO_POINT", "PUSH_BALL"]:
+            if self.check_stuck_by_expected_progress():
+                print("EXPECTED-PROGRESS RECOVERY TRIGGERED")
+                self.finite_state = "BACK_UP_RECOVER"
+                self.backup_start_pose = None
+                self.progress_history = []
+                self.state_steps = 0
+                self.prev_state = None
+                return {"left_motor": 0.0, "right_motor": 0.0}
 
+        if self.finite_state in ["BACK_UP_RECOVER", "BACK_UP"]:
+            if self.check_stuck_by_expected_progress():
+                print("BACKUP STUCK TOO, RESETTING")
+                self.backup_start_pose = None
+                self.progress_history = []
+                self.drive_line_frozen = False
+                self.initial_line_error = None
+                self.drive_line_angle = None
+                self.drive_line_ball = None
+                self.drive_line_unit = None
+                self.drive_offset_point = None
+                self.state_steps = 0
+                self.prev_state = None
+                self.finite_state = "FIND_BALL"
+                return {"left_motor": 0.0, "right_motor": 0.0}
+            
         return control_dict
