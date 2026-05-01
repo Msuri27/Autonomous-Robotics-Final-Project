@@ -6,9 +6,10 @@ import numpy as np
 MAX_SPEED = 6.5
 
 # Line-of-action staging
-LOA_OFFSET = 0.75       # distance behind ball toward opposite side of goal
+LOA_OFFSET = 0.25       # distance behind ball toward opposite side of goal
 STAGING_TOL = 0.15      # how close robot must get to offset point
 FREEZE_DISTANCE = 0.8
+LINE_TOL = 0.08
 
 # Turning thresholds
 ANGLE_TOL = 0.06        # heading tolerance for turn-in-place states
@@ -51,6 +52,12 @@ class StudentController:
         self.drive_offset_point = None
         self.drive_line_angle = None
         self.initial_side_error = None
+
+        self.initial_line_error = None
+        self.frozen_line_vertical = False
+        self.frozen_m = 0.0
+        self.frozen_b = 0.0
+        self.frozen_x = 0.0
 
     def wrap(self, angle):
         return np.arctan2(np.sin(angle), np.cos(angle))
@@ -244,6 +251,10 @@ class StudentController:
         live_ball, live_loa_unit, live_offset_point, live_loa_angle = self.get_loa_geometry(sensors)
         dist_to_ball = np.linalg.norm(live_ball - robot)
 
+        # wall collision avoidance:
+        # if x_r < -5.0 or x_r > 5.0 or y_r < -5.0 or y_r > 5.0:
+        #     self.finite_state = "FIND_BALL"
+
         if not self.drive_line_frozen and dist_to_ball < FREEZE_DISTANCE:
             self.drive_line_frozen = True
             self.drive_line_ball = live_ball
@@ -251,40 +262,61 @@ class StudentController:
             self.drive_offset_point = live_offset_point
             self.drive_line_angle = live_loa_angle
 
+            # Build frozen line equation
+            x_b, y_b = live_ball
+            dx, dy = live_loa_unit
+
+            if abs(dx) > 1e-6:
+                self.frozen_line_vertical = False
+                self.frozen_m = dy / dx
+                self.frozen_b = y_b - self.frozen_m * x_b
+
+                y_line = self.frozen_m * x_r + self.frozen_b
+                self.initial_line_error = y_r - y_line
+            else:
+                self.frozen_line_vertical = True
+                self.frozen_x = x_b
+                self.initial_line_error = x_r - self.frozen_x
+
             print(f"FROZEN_OFFSET_POINT: {live_offset_point}")
 
-            robot_vec = robot - self.drive_line_ball
-            self.initial_side_error = (
-                self.drive_line_unit[0] * robot_vec[1]
-                - self.drive_line_unit[1] * robot_vec[0]
-            )
-
         if self.drive_line_frozen:
-            ball = self.drive_line_ball
-            loa_unit = self.drive_line_unit
             offset_point = self.drive_offset_point
 
-            robot_vec = robot - ball
-            current_side_error = loa_unit[0] * robot_vec[1] - loa_unit[1] * robot_vec[0]
+            if self.frozen_line_vertical:
+                current_line_error = x_r - self.frozen_x
+                line_dist = abs(current_line_error)
+            else:
+                y_line = self.frozen_m * x_r + self.frozen_b
+                current_line_error = y_r - y_line
+                line_dist = abs(current_line_error)
 
             crossed_line = (
-                self.initial_side_error is not None
-                and current_side_error * self.initial_side_error <= 0
+                self.initial_line_error is not None
+                and current_line_error * self.initial_line_error <= 0
             )
 
-            print(f"FROZEN_OFFSET_POINT: {offset_point}")
             dist_to_offset = np.linalg.norm(offset_point - robot)
 
-            if crossed_line or dist_to_offset < STAGING_TOL:
+            print(
+                "LINE_CHECK:",
+                "current_error", current_line_error,
+                "initial_error", self.initial_line_error,
+                "crossed", crossed_line,
+                "line_dist", line_dist,
+                "dist_offset", dist_to_offset
+            )
+
+            if crossed_line or line_dist < LINE_TOL or dist_to_offset < STAGING_TOL:
                 self.drive_line_frozen = False
-                self.initial_side_error = None
+                self.initial_line_error = None
                 self.finite_state = "TURN_TO_LOA"
                 return {"left_motor": 0.0, "right_motor": 0.0}
 
         return {
             "left_motor": STAGE_SPEED,
             "right_motor": STAGE_SPEED
-    }
+        }
 
     def turn_to_loa(self, sensors):
         if self.drive_line_angle is not None:
@@ -322,6 +354,9 @@ class StudentController:
         ball_obs = sensors.get("ball", None)
         if ball_obs is None:
             self.finite_state = "BACK_UP"
+        ball_coords = self.get_ball_coords(sensors)
+        if ball_coords[0] > (self.goal_coords[0] + 0.1) and -0.7 < ball_coords[1] < 0.7:
+            self.finite_state = "DONE"
 
         return {
             "left_motor": max(-MAX_SPEED, min(MAX_SPEED, left)),
